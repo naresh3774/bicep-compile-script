@@ -1,62 +1,70 @@
 <#
 .SYNOPSIS
-    Generic Azure Bicep Drift Detection Script
-    - Works for any Resource Group
-    - Does NOT modify or delete local or Azure resources
-    - Supports supported and unsupported resources
-    - Handles decompilation errors safely
-    - Generates drift-changes.bicep and drift-summary.txt
+    Module-wise Bicep Drift Detection Script
+    - Exports Azure → Decompile → Compare → Generate module Bicep for drift
+    - Safe for any deployment
 #>
 
 param(
     [Parameter(Mandatory=$true)]
     [string]$ResourceGroup,
+
     [Parameter(Mandatory=$true)]
     [string]$LocalRoot
 )
 
-# --- Local folders ---
+# ------------------------------
+# Local folders
+# ------------------------------
 $LocalModulesFolder  = Join-Path $LocalRoot "modules"
 $LocalExistingFolder = Join-Path $LocalRoot "existing"
 
-# --- Temporary folders ---
-$TempRoot     = Join-Path $env:TEMP "bicep-drift"
-$ExportJson   = Join-Path $TempRoot "export.json"
-$ExportBicep  = Join-Path $TempRoot "export.bicep"
-$SplitFolder  = Join-Path $TempRoot "split"
+# ------------------------------
+# Temporary folders
+# ------------------------------
+$TempRoot         = Join-Path $env:TEMP "bicep-drift"
+$ExportJson        = Join-Path $TempRoot "export.json"
+$ExportBicep       = Join-Path $TempRoot "export.bicep"
+$SplitFolder       = Join-Path $TempRoot "split"
 $UnsupportedFolder = Join-Path $TempRoot "unsupported"
 
-# --- Output files ---
-$DriftBicep   = Join-Path $LocalRoot "drift-changes.bicep"
-$SummaryFile  = Join-Path $LocalRoot "drift-summary.txt"
+# ------------------------------
+# Output files
+# ------------------------------
+$SummaryFile = Join-Path $LocalRoot "drift-summary.txt"
 
-# --- Prepare folders safely (no deletion of local components) ---
-if (-not (Test-Path $TempRoot)) { New-Item -ItemType Directory $TempRoot | Out-Null }
-if (-not (Test-Path $SplitFolder)) { New-Item -ItemType Directory $SplitFolder | Out-Null }
-if (-not (Test-Path $UnsupportedFolder)) { New-Item -ItemType Directory $UnsupportedFolder | Out-Null }
-
-# --- 1. Export ARM template ---
-Write-Host "`n=== Exporting Azure → ARM JSON ===" -ForegroundColor Cyan
-$ExportOutput = az group export --name $ResourceGroup 2>&1
-
-$UnsupportedResources = @()
-foreach ($line in $ExportOutput) {
-    if ($line -match "ERROR: Could not get resources of the type '([A-Za-z0-9./@]+)'") {
-        $UnsupportedResources += $Matches[1]
-    }
+# ------------------------------
+# Prepare folders (do not delete local files)
+# ------------------------------
+foreach ($folder in @($TempRoot, $SplitFolder, $UnsupportedFolder)) {
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory $folder | Out-Null }
 }
 
-az group export --name $ResourceGroup | Out-File $ExportJson -Encoding utf8
-
-# --- 2. Decompile supported resources safely ---
-Write-Host "`n=== Decompiling ARM → Bicep (supported resources) ===" -ForegroundColor Cyan
+# ------------------------------
+# 1. Export ARM Template (safe fallback)
+# ------------------------------
+Write-Host "`n=== Exporting Azure → ARM JSON ===" -ForegroundColor Cyan
 try {
-    az bicep decompile --file $ExportJson --force
+    az group export --name $ResourceGroup | Out-File $ExportJson -Encoding utf8
+} catch {
+    Write-Warning "Group export failed, falling back to per-resource export."
+    $Resources = az resource list --resource-group $ResourceGroup | ConvertFrom-Json
+    $Resources | ConvertTo-Json -Depth 10 | Out-File $ExportJson -Encoding utf8
+}
+
+# ------------------------------
+# 2. Decompile to Bicep (supported resources)
+# ------------------------------
+Write-Host "`n=== Decompiling ARM → Bicep ===" -ForegroundColor Cyan
+try {
+    az bicep decompile --file $ExportJson --stdout | Out-File $ExportBicep -Encoding utf8
 } catch {
     Write-Warning "Bicep decompile failed for some resources. They will be handled as placeholders."
 }
 
-# --- Split exported Bicep into individual resources ---
+# ------------------------------
+# 3. Split decompiled Bicep into per-resource files
+# ------------------------------
 $Lines = Get-Content $ExportBicep -ErrorAction SilentlyContinue
 $CurrName = ""; $CurrContent = ""
 if ($Lines) {
@@ -66,7 +74,8 @@ if ($Lines) {
                 $OutFile = Join-Path $SplitFolder "$CurrName.bicep"
                 $CurrContent.Trim() | Out-File $OutFile -Encoding utf8
             }
-            $CurrName = $Matches[1]; $CurrContent = $Line + "`n"
+            $CurrName = $Matches[1]
+            $CurrContent = $Line + "`n"
         } else {
             $CurrContent += $Line + "`n"
         }
@@ -77,73 +86,64 @@ if ($Lines) {
     }
 }
 
-# --- 3. Handle unsupported resources safely ---
-$UnsupportedGenerated = @()
-foreach ($ResType in $UnsupportedResources) {
-    Write-Host "`nProcessing unsupported type: $ResType" -ForegroundColor Yellow
-    $Resources = az resource list --resource-group $ResourceGroup --resource-type $ResType | ConvertFrom-Json
-    foreach ($res in $Resources) {
-        if (-not $res.id) { continue }
-        $ResName = $res.name
-        $TempBicep = Join-Path $UnsupportedFolder "$ResName.bicep"
+# ------------------------------
+# 4. Detect added/changed/removed resources
+# ------------------------------
+$Added = @(); $Changed = @(); $Removed = @(); $Unsupported = @(); $ModuleDrift = @{}
 
-        # Placeholder Bicep for manual review
-        $Placeholder = @"
-//// UNSUPPORTED RESOURCE: $ResName
-//// Type: $ResType
-//// Manual review required
-resource $ResName '$($ResType)@2023-01-01' = {
-  name: '$ResName'
-  location: 'PLACEHOLDER'
-}
-"@
-        $Placeholder | Out-File $TempBicep -Encoding utf8
-        $UnsupportedGenerated += $TempBicep
-    }
-}
+# Find all local resources
+$LocalFiles = Get-ChildItem $LocalModulesFolder -Filter *.bicep -Recurse
+$LocalNames = $LocalFiles | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_.FullName) }
 
-# --- 4. Compare all resources ---
-$DriftResources = @(); $Added = @(); $Changed = @()
-$AllGeneratedFiles = Get-ChildItem $SplitFolder -Filter *.bicep | Select-Object -ExpandProperty FullName
-$AllGeneratedFiles += $UnsupportedGenerated
-
-foreach ($GeneratedFile in $AllGeneratedFiles) {
-    $ResourceName = [IO.Path]::GetFileNameWithoutExtension($GeneratedFile)
+# Process generated/exported Bicep
+$GeneratedFiles = Get-ChildItem $SplitFolder -Filter *.bicep
+foreach ($Gen in $GeneratedFiles) {
+    $ResName = [IO.Path]::GetFileNameWithoutExtension($Gen.FullName)
+    $LocalFileModule = Join-Path $LocalModulesFolder "$ResName.bicep"
+    $LocalFileExisting = Join-Path $LocalExistingFolder "$ResName.bicep"
     $LocalFile = $null
-    $ModuleFile = Join-Path $LocalModulesFolder "$ResourceName.bicep"
-    $ExistFile  = Join-Path $LocalExistingFolder "$ResourceName.bicep"
+    if (Test-Path $LocalFileModule) { $LocalFile = $LocalFileModule }
+    elseif (Test-Path $LocalFileExisting) { $LocalFile = $LocalFileExisting }
 
-    if (Test-Path $ModuleFile) { $LocalFile = $ModuleFile }
-    elseif (Test-Path $ExistFile) { $LocalFile = $ExistFile }
-
-    $GeneratedContent = Get-Content $GeneratedFile -Raw
+    $GenContent = Get-Content $Gen -Raw
     if ($LocalFile) {
         $LocalContent = Get-Content $LocalFile -Raw
-        if ($GeneratedContent -ne $LocalContent) {
-            $Changed += $ResourceName
-            $DriftResources += $GeneratedContent
+        if ($GenContent -ne $LocalContent) {
+            $Changed += $ResName
+            $ModuleDrift[$ResName] = $GenContent
         }
     } else {
-        $Added += $ResourceName
-        $DriftResources += $GeneratedContent
+        $Added += $ResName
+        $ModuleDrift[$ResName] = $GenContent
     }
 }
 
-# --- 5. Write drift-changes.bicep ---
-if ($DriftResources.Count -eq 0) {
-    "" | Out-File $DriftBicep -Encoding utf8
-    Write-Host "`nNo added or changed resources detected." -ForegroundColor Green
-} else {
-    $DriftResources -join "`n`n" | Out-File $DriftBicep -Encoding utf8
-    Write-Host "`n✅ Drift Bicep file generated: $DriftBicep" -ForegroundColor Yellow
+# Detect removed resources (present locally but missing in Azure)
+foreach ($LocalName in $LocalNames) {
+    $ExistsInAzure = $GeneratedFiles | Where-Object { $_.Name -eq $LocalName }
+    if (-not $ExistsInAzure) {
+        $Removed += $LocalName
+        $ModuleDrift[$LocalName] = @"
+//// REMOVED RESOURCE: $LocalName
+resource $LocalName 'REMOVED' = {
+  // This resource no longer exists in Azure
+}
+"@
+    }
 }
 
-# --- 6. Write drift-summary.txt with manual review commands ---
-$UnsupportedCommands = @()
-foreach ($ResType in $UnsupportedResources) {
-    $UnsupportedCommands += "az resource list --resource-group $ResourceGroup --resource-type $ResType"
+# ------------------------------
+# 5. Generate per-module drift Bicep
+# ------------------------------
+foreach ($ResName in $ModuleDrift.Keys) {
+    $Content = $ModuleDrift[$ResName]
+    $OutFile = Join-Path $LocalModulesFolder "$ResName.drift.bicep"
+    $Content | Out-File $OutFile -Encoding utf8
 }
 
+# ------------------------------
+# 6. Generate drift summary
+# ------------------------------
 $Summary = @"
 ============================
 BICEP DRIFT SUMMARY
@@ -157,14 +157,18 @@ $(if ($Added) { $Added -join "`n" } else { "None" })
 CHANGED RESOURCES:
 $(if ($Changed) { $Changed -join "`n" } else { "None" })
 
-UNSUPPORTED RESOURCES (manual review required):
-$(if ($UnsupportedResources) { $UnsupportedResources -join "`n" } else { "None" })
+REMOVED RESOURCES:
+$(if ($Removed) { $Removed -join "`n" } else { "None" })
+
+UNSUPPORTED RESOURCES:
+$(if ($Unsupported) { $Unsupported -join "`n" } else { "None" })
 
 COMMANDS TO INSPECT UNSUPPORTED RESOURCES:
-$(if ($UnsupportedCommands) { $UnsupportedCommands -join "`n" } else { "None" })
+$(if ($Unsupported) { $Unsupported | ForEach-Object { "az resource list --resource-group $ResourceGroup --resource-type $_" } } else { "None" })
 
 "@
 
 $Summary | Out-File $SummaryFile -Encoding utf8
 Write-Host "`n📄 Drift summary written to: $SummaryFile" -ForegroundColor Yellow
-Write-Host "`nDone. ✅ Script is safe and does NOT delete or modify resources."
+Write-Host "`n✅ Drift Bicep per module written to: $LocalModulesFolder/*.drift.bicep"
+Write-Host "`nDone. Script is safe and does NOT delete or modify resources."
