@@ -105,9 +105,9 @@ foreach ($Gen in $GeneratedFiles) {
     if (Test-Path $LocalFileModule) { $LocalFile = $LocalFileModule }
     elseif (Test-Path $LocalFileExisting) { $LocalFile = $LocalFileExisting }
 
-    $GenContent = Get-Content $Gen -Raw
+    $GenContent = (Get-Content $Gen -Raw).Trim() -replace '\r\n', '\n' -replace '\s+\n', '\n'
     if ($LocalFile) {
-        $LocalContent = Get-Content $LocalFile -Raw
+        $LocalContent = (Get-Content $LocalFile -Raw).Trim() -replace '\r\n', '\n' -replace '\s+\n', '\n'
         if ($GenContent -ne $LocalContent) {
             $Changed += $ResName
             $ModuleDrift[$ResName] = $GenContent
@@ -133,12 +133,17 @@ resource $LocalName 'REMOVED' = {
 }
 
 # ------------------------------
-# 5. Generate per-module drift Bicep
+# 5. Generate per-module drift Bicep (only if drift exists)
 # ------------------------------
-foreach ($ResName in $ModuleDrift.Keys) {
-    $Content = $ModuleDrift[$ResName]
-    $OutFile = Join-Path $LocalModulesFolder "$ResName.drift.bicep"
-    $Content | Out-File $OutFile -Encoding utf8
+if ($ModuleDrift.Count -gt 0) {
+    foreach ($ResName in $ModuleDrift.Keys) {
+        $Content = $ModuleDrift[$ResName]
+        $OutFile = Join-Path $LocalModulesFolder "$ResName.drift.bicep"
+        $Content | Out-File $OutFile -Encoding utf8
+    }
+    Write-Host "`n✅ Drift Bicep files created in: $LocalModulesFolder/*.drift.bicep" -ForegroundColor Yellow
+} else {
+    Write-Host "`n✨ No drift detected - no .drift.bicep files created" -ForegroundColor Green
 }
 
 # ------------------------------
@@ -170,5 +175,4 @@ $(if ($Unsupported) { $Unsupported | ForEach-Object { "az resource list --resour
 
 $Summary | Out-File $SummaryFile -Encoding utf8
 Write-Host "`n📄 Drift summary written to: $SummaryFile" -ForegroundColor Yellow
-Write-Host "`n✅ Drift Bicep per module written to: $LocalModulesFolder/*.drift.bicep"
 Write-Host "`nDone. Script is safe and does NOT delete or modify resources."
