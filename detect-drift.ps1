@@ -32,6 +32,8 @@ $UnsupportedFolder = Join-Path $TempRoot "unsupported"
 # Output files
 # ------------------------------
 $SummaryFile = Join-Path $LocalRoot "drift-summary.txt"
+$MissingResourcesFile = Join-Path $LocalRoot "missing-resources.txt"
+$MissingResourcesBicepFile = Join-Path $LocalRoot "missing-resources.bicep"
 
 # ------------------------------
 # Prepare folders (do not delete local files)
@@ -110,6 +112,46 @@ if ($Lines) {
 # 5. Detect added/changed/removed resources
 # ------------------------------
 $Added = @(); $Changed = @(); $Removed = @(); $Unsupported = $UnsupportedResources; $ModuleDrift = @{}
+$MissingLocally = @()
+
+# Find all local resources (exclude .drift.bicep files)
+$LocalFiles = Get-ChildItem $LocalModulesFolder -Filter *.bicep -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '\.drift\.bicep$' }
+$LocalNames = $LocalFiles | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_.FullName) }
+
+Write-Host "`n=== Comparing Azure resources with local Bicep files ===" -ForegroundColor Cyan
+Write-Host "Local Bicep files found: $($LocalFiles.Count)" -ForegroundColor Gray
+
+# Check each Azure resource against local files
+foreach ($AzResource in $AllAzureResources) {
+    $ResourceName = $AzResource.name
+    $ResourceType = $AzResource.type
+    
+    # Normalize resource name (remove special characters that might differ)
+    $NormalizedName = $ResourceName -replace '[^a-zA-Z0-9-]', ''
+    
+    # Check if this resource has a corresponding local Bicep file
+    $LocalMatch = $LocalNames | Where-Object { 
+        $_ -eq $ResourceName -or 
+        $_ -eq $NormalizedName -or
+        $ResourceName -like "*$_*"
+    }
+    
+    if (-not $LocalMatch) {
+        $MissingLocally += @{
+            Name = $ResourceName
+            Type = $ResourceType
+            Id = $AzResource.id
+        }
+    }
+}
+
+if ($MissingLocally.Count -gt 0) {
+    Write-Host "`n🔍 MISSING IN LOCAL BICEP: $($MissingLocally.Count) Azure resource(s) have no local Bicep file:" -ForegroundColor Magenta
+    $MissingLocally | ForEach-Object {
+        Write-Host "  ❌ $($_.Name) [$($_.Type)]" -ForegroundColor Magenta
+    }
+    Write-Host "`nThese resources exist in Azure but you don't have Bicep files for them in your modules folder." -ForegroundColor Yellow
+}
 
 # Detect resources that exist in Azure but weren't exported/decompiled
 $MissingFromExport = @()
@@ -130,16 +172,13 @@ foreach ($AzResource in $AllAzureResources) {
 }
 
 if ($MissingFromExport.Count -gt 0) {
-    Write-Host "`n⚠️ WARNING: $($MissingFromExport.Count) resource(s) exist in Azure but weren't exported:" -ForegroundColor Yellow
+    Write-Host "`n⚠️  NOT EXPORTED: $($MissingFromExport.Count) resource(s) exist in Azure but weren't exported by 'az group export':" -ForegroundColor Yellow
     $MissingFromExport | ForEach-Object {
         Write-Host "  - $($_.Name) [$($_.Type)]" -ForegroundColor Yellow
         $Unsupported += "$($_.Name) [$($_.Type)]"
     }
+    Write-Host "`nThese may be child resources, unsupported types, or require manual export." -ForegroundColor Gray
 }
-
-# Find all local resources (exclude .drift.bicep files)
-$LocalFiles = Get-ChildItem $LocalModulesFolder -Filter *.bicep -Recurse | Where-Object { $_.Name -notmatch '\.drift\.bicep$' }
-$LocalNames = $LocalFiles | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_.FullName) }
 
 # Process generated/exported Bicep
 $GeneratedFiles = Get-ChildItem $SplitFolder -Filter *.bicep
@@ -193,7 +232,74 @@ if ($ModuleDrift.Count -gt 0) {
 }
 
 # ------------------------------
-# 7. Generate drift summary
+# 7. Generate missing resources Bicep file
+# ------------------------------
+if ($MissingLocally.Count -gt 0) {
+    $MissingBicepContent = @"
+// ============================================
+// MISSING RESOURCES IN LOCAL BICEP
+// Generated: $(Get-Date)
+// Resource Group: $ResourceGroup
+// ============================================
+// These resources exist in Azure but are missing from your local Bicep files.
+// Add the ones you need to your modules folder.
+
+"@
+
+    foreach ($Missing in $MissingLocally) {
+        $ResourceName = $Missing.Name
+        $ResourceType = $Missing.Type
+        $ResourceId = $Missing.Id
+        
+        # Try to get the resource details and generate Bicep
+        try {
+            $ResourceJson = az resource show --ids "$ResourceId" 2>$null | ConvertFrom-Json
+            $ApiVersion = $ResourceJson.apiVersion
+            if (-not $ApiVersion) {
+                # Get latest API version for the resource type
+                $ApiVersion = "2023-01-01" # fallback
+            }
+            
+            $MissingBicepContent += @"
+
+// ============================================
+// Resource: $ResourceName
+// Type: $ResourceType
+// ============================================
+resource $(($ResourceName -replace '[^a-zA-Z0-9]','')) '$ResourceType@$ApiVersion' = {
+  name: '$ResourceName'
+  location: resourceGroup().location
+  // TODO: Add properties from Azure portal or use 'az resource show --ids $ResourceId'
+  properties: {
+    // Configure based on your requirements
+  }
+}
+
+"@
+        } catch {
+            $MissingBicepContent += @"
+
+// ============================================
+// Resource: $ResourceName  
+// Type: $ResourceType
+// ============================================
+// Error retrieving details. Use: az resource show --ids $ResourceId
+resource $(($ResourceName -replace '[^a-zA-Z0-9]','')) '$ResourceType@2023-01-01' = {
+  name: '$ResourceName'
+  location: resourceGroup().location
+  properties: {}
+}
+
+"@
+        }
+    }
+    
+    $MissingBicepContent | Out-File $MissingResourcesBicepFile -Encoding utf8
+    Write-Host "`n📝 Missing resources Bicep template: $MissingResourcesBicepFile" -ForegroundColor Cyan
+}
+
+# ------------------------------
+# 8. Generate drift summary
 # ------------------------------
 $Summary = @"
 ============================
@@ -202,23 +308,61 @@ Resource Group: $ResourceGroup
 Generated: $(Get-Date)
 ============================
 
-ADDED RESOURCES:
-$(if ($Added) { $Added -join "`n" } else { "None" })
-
-CHANGED RESOURCES:
+CHANGED RESOURCES (content differs):
 $(if ($Changed) { $Changed -join "`n" } else { "None" })
 
-REMOVED RESOURCES:
+ADDED RESOURCES (in generated split but not in local):
+$(if ($Added) { $Added -join "`n" } else { "None" })
+
+REMOVED RESOURCES (in local but not in Azure):
 $(if ($Removed) { $Removed -join "`n" } else { "None" })
 
-UNSUPPORTED RESOURCES:
-$(if ($Unsupported) { $Unsupported -join "`n" } else { "None" })
+NOT EXPORTED (exist in Azure but 'az group export' failed):
+$(if ($MissingFromExport) { $MissingFromExport | ForEach-Object { "$($_.Name) [$($_.Type)]" } | Out-String } else { "None" })
 
-COMMANDS TO INSPECT UNSUPPORTED RESOURCES:
-$(if ($Unsupported) { $Unsupported | ForEach-Object { "az resource list --resource-group $ResourceGroup --resource-type $_" } } else { "None" })
+UNSUPPORTED RESOURCES (decompile warnings):
+$(if ($Unsupported) { $Unsupported -join "`n" } else { "None" })
 
 "@
 
 $Summary | Out-File $SummaryFile -Encoding utf8
+
+# Generate separate missing resources summary
+if ($MissingLocally.Count -gt 0) {
+    $MissingSummary = @"
+============================
+MISSING RESOURCES IN LOCAL BICEP
+Resource Group: $ResourceGroup  
+Generated: $(Get-Date)
+============================
+
+These $($MissingLocally.Count) resource(s) exist in Azure but have no corresponding Bicep file in your modules folder:
+
+"@
+    
+    foreach ($Missing in $MissingLocally) {
+        $MissingSummary += "❌ $($Missing.Name)`n   Type: $($Missing.Type)`n   ID: $($Missing.Id)`n`n"
+    }
+    
+    $MissingSummary += @"
+
+ACTION REQUIRED:
+-----------------
+1. Review the generated file: missing-resources.bicep
+2. Copy the resource definitions you need to your modules folder
+3. Customize the properties according to your requirements
+4. Re-run this script to verify
+
+NOTE: Child resources (like network interfaces for private endpoints) may be
+automatically managed by their parent resources and don't need separate files.
+"@
+    
+    $MissingSummary | Out-File $MissingResourcesFile -Encoding utf8
+    Write-Host "📋 Missing resources summary: $MissingResourcesFile" -ForegroundColor Cyan
+}
 Write-Host "`n📄 Drift summary written to: $SummaryFile" -ForegroundColor Yellow
+if ($MissingLocally.Count -gt 0) {
+    Write-Host "📋 Missing resources list: $MissingResourcesFile" -ForegroundColor Yellow
+    Write-Host "📝 Missing resources Bicep: $MissingResourcesBicepFile" -ForegroundColor Yellow
+}
 Write-Host "`nDone. Script is safe and does NOT delete or modify resources."
