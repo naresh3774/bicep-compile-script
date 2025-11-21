@@ -56,10 +56,15 @@ try {
 # 2. Decompile to Bicep (supported resources)
 # ------------------------------
 Write-Host "`n=== Decompiling ARM → Bicep ===" -ForegroundColor Cyan
-try {
-    az bicep decompile --file $ExportJson --stdout | Out-File $ExportBicep -Encoding utf8
-} catch {
-    Write-Warning "Bicep decompile failed for some resources. They will be handled as placeholders."
+$DecompileOutput = az bicep decompile --file $ExportJson --stdout 2>&1
+$DecompileOutput | Out-File $ExportBicep -Encoding utf8
+
+# Capture unsupported resources from stderr
+$UnsupportedResources = @()
+$DecompileOutput | Where-Object { $_ -match "WARNING.*not.*supported|unable to decompile" } | ForEach-Object {
+    if ($_ -match "'([^']+)'" -or $_ -match "type '([^']+)'") {
+        $UnsupportedResources += $Matches[1]
+    }
 }
 
 # ------------------------------
@@ -89,10 +94,10 @@ if ($Lines) {
 # ------------------------------
 # 4. Detect added/changed/removed resources
 # ------------------------------
-$Added = @(); $Changed = @(); $Removed = @(); $Unsupported = @(); $ModuleDrift = @{}
+$Added = @(); $Changed = @(); $Removed = @(); $Unsupported = $UnsupportedResources; $ModuleDrift = @{}
 
-# Find all local resources
-$LocalFiles = Get-ChildItem $LocalModulesFolder -Filter *.bicep -Recurse
+# Find all local resources (exclude .drift.bicep files)
+$LocalFiles = Get-ChildItem $LocalModulesFolder -Filter *.bicep -Recurse | Where-Object { $_.Name -notmatch '\.drift\.bicep$' }
 $LocalNames = $LocalFiles | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_.FullName) }
 
 # Process generated/exported Bicep
@@ -114,13 +119,13 @@ foreach ($Gen in $GeneratedFiles) {
         }
     } else {
         $Added += $ResName
-        $ModuleDrift[$ResName] = $GenContent
+        # Don't add to ModuleDrift - new resources don't need drift files
     }
 }
 
 # Detect removed resources (present locally but missing in Azure)
 foreach ($LocalName in $LocalNames) {
-    $ExistsInAzure = $GeneratedFiles | Where-Object { $_.Name -eq $LocalName }
+    $ExistsInAzure = $GeneratedFiles | Where-Object { [IO.Path]::GetFileNameWithoutExtension($_.Name) -eq $LocalName }
     if (-not $ExistsInAzure) {
         $Removed += $LocalName
         $ModuleDrift[$LocalName] = @"
@@ -141,7 +146,7 @@ if ($ModuleDrift.Count -gt 0) {
         $OutFile = Join-Path $LocalModulesFolder "$ResName.drift.bicep"
         $Content | Out-File $OutFile -Encoding utf8
     }
-    Write-Host "`n✅ Drift Bicep files created in: $LocalModulesFolder/*.drift.bicep" -ForegroundColor Yellow
+    Write-Host "`n✅ Created $($ModuleDrift.Count) .drift.bicep file(s) for CHANGED/REMOVED resources" -ForegroundColor Yellow
 } else {
     Write-Host "`n✨ No drift detected - no .drift.bicep files created" -ForegroundColor Green
 }
