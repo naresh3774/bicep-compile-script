@@ -41,7 +41,19 @@ foreach ($folder in @($TempRoot, $SplitFolder, $UnsupportedFolder)) {
 }
 
 # ------------------------------
-# 1. Export ARM Template (safe fallback)
+# 1. List ALL resources in resource group first
+# ------------------------------
+Write-Host "`n=== Listing all resources in resource group ===" -ForegroundColor Cyan
+$AllAzureResources = az resource list --resource-group $ResourceGroup | ConvertFrom-Json
+Write-Host "Found $($AllAzureResources.Count) resources in Azure" -ForegroundColor Green
+
+# Display resource types for visibility
+$ResourceTypes = $AllAzureResources | Select-Object -ExpandProperty type | Sort-Object -Unique
+Write-Host "`nResource types found:"
+$ResourceTypes | ForEach-Object { Write-Host "  - $_" -ForegroundColor Gray }
+
+# ------------------------------
+# 2. Export ARM Template (safe fallback)
 # ------------------------------
 Write-Host "`n=== Exporting Azure → ARM JSON ===" -ForegroundColor Cyan
 try {
@@ -53,7 +65,7 @@ try {
 }
 
 # ------------------------------
-# 2. Decompile to Bicep (supported resources)
+# 3. Decompile to Bicep (supported resources)
 # ------------------------------
 Write-Host "`n=== Decompiling ARM → Bicep ===" -ForegroundColor Cyan
 $DecompileOutput = az bicep decompile --file $ExportJson --stdout 2>&1
@@ -68,16 +80,18 @@ $DecompileOutput | Where-Object { $_ -match "WARNING.*not.*supported|unable to d
 }
 
 # ------------------------------
-# 3. Split decompiled Bicep into per-resource files
+# 4. Split decompiled Bicep into per-resource files
 # ------------------------------
 $Lines = Get-Content $ExportBicep -ErrorAction SilentlyContinue
 $CurrName = ""; $CurrContent = ""
+$ExportedResourceNames = @()
 if ($Lines) {
     foreach ($Line in $Lines) {
         if ($Line -match "resource\s+([^\s]+)\s+'[^']+'\s*@") {
             if ($CurrName -ne "") {
                 $OutFile = Join-Path $SplitFolder "$CurrName.bicep"
                 $CurrContent.Trim() | Out-File $OutFile -Encoding utf8
+                $ExportedResourceNames += $CurrName
             }
             $CurrName = $Matches[1]
             $CurrContent = $Line + "`n"
@@ -88,13 +102,40 @@ if ($Lines) {
     if ($CurrName -ne "") {
         $OutFile = Join-Path $SplitFolder "$CurrName.bicep"
         $CurrContent.Trim() | Out-File $OutFile -Encoding utf8
+        $ExportedResourceNames += $CurrName
     }
 }
 
 # ------------------------------
-# 4. Detect added/changed/removed resources
+# 5. Detect added/changed/removed resources
 # ------------------------------
 $Added = @(); $Changed = @(); $Removed = @(); $Unsupported = $UnsupportedResources; $ModuleDrift = @{}
+
+# Detect resources that exist in Azure but weren't exported/decompiled
+$MissingFromExport = @()
+foreach ($AzResource in $AllAzureResources) {
+    $ResourceName = $AzResource.name
+    $ResourceType = $AzResource.type
+    
+    # Check if this resource was successfully exported and decompiled
+    $WasExported = $ExportedResourceNames -contains $ResourceName
+    
+    if (-not $WasExported) {
+        $MissingFromExport += @{
+            Name = $ResourceName
+            Type = $ResourceType
+            Id = $AzResource.id
+        }
+    }
+}
+
+if ($MissingFromExport.Count -gt 0) {
+    Write-Host "`n⚠️ WARNING: $($MissingFromExport.Count) resource(s) exist in Azure but weren't exported:" -ForegroundColor Yellow
+    $MissingFromExport | ForEach-Object {
+        Write-Host "  - $($_.Name) [$($_.Type)]" -ForegroundColor Yellow
+        $Unsupported += "$($_.Name) [$($_.Type)]"
+    }
+}
 
 # Find all local resources (exclude .drift.bicep files)
 $LocalFiles = Get-ChildItem $LocalModulesFolder -Filter *.bicep -Recurse | Where-Object { $_.Name -notmatch '\.drift\.bicep$' }
@@ -138,7 +179,7 @@ resource $LocalName 'REMOVED' = {
 }
 
 # ------------------------------
-# 5. Generate per-module drift Bicep (only if drift exists)
+# 6. Generate per-module drift Bicep (only if drift exists)
 # ------------------------------
 if ($ModuleDrift.Count -gt 0) {
     foreach ($ResName in $ModuleDrift.Keys) {
@@ -152,7 +193,7 @@ if ($ModuleDrift.Count -gt 0) {
 }
 
 # ------------------------------
-# 6. Generate drift summary
+# 7. Generate drift summary
 # ------------------------------
 $Summary = @"
 ============================
