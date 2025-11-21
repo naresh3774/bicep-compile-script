@@ -111,32 +111,40 @@ if ($Lines) {
 # ------------------------------
 # 5. Detect added/changed/removed resources
 # ------------------------------
+
 $Added = @(); $Changed = @(); $Removed = @(); $Unsupported = $UnsupportedResources; $ModuleDrift = @{}
 $MissingLocally = @()
 
 # Find all local resources (exclude .drift.bicep files)
 $LocalFiles = Get-ChildItem $LocalModulesFolder -Filter *.bicep -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '\.drift\.bicep$' }
-$LocalNames = $LocalFiles | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_.FullName) }
+$LocalResourceDeclarations = @()
+foreach ($file in $LocalFiles) {
+    $lines = Get-Content $file.FullName
+    foreach ($line in $lines) {
+        if ($line -match "resource\\s+([a-zA-Z0-9_-]+)\\s+'([^']+)'") {
+            $LocalResourceDeclarations += [PSCustomObject]@{
+                Name = $Matches[1]
+                Type = $Matches[2]
+            }
+        }
+    }
+}
 
-Write-Host "`n=== Comparing Azure resources with local Bicep files ===" -ForegroundColor Cyan
-Write-Host "Local Bicep files found: $($LocalFiles.Count)" -ForegroundColor Gray
+Write-Host "`n=== Comparing Azure resources with local Bicep files (name AND type match required) ===" -ForegroundColor Cyan
+Write-Host "Local Bicep resource declarations found: $($LocalResourceDeclarations.Count)" -ForegroundColor Gray
 
-# Check each Azure resource against local files
+# Check each Azure resource against local files (name AND type must match)
 foreach ($AzResource in $AllAzureResources) {
     $ResourceName = $AzResource.name
     $ResourceType = $AzResource.type
-    
-    # Normalize resource name (remove special characters that might differ)
-    $NormalizedName = $ResourceName -replace '[^a-zA-Z0-9-]', ''
-    
-    # Check if this resource has a corresponding local Bicep file
-    $LocalMatch = $LocalNames | Where-Object { 
-        $_ -eq $ResourceName -or 
-        $_ -eq $NormalizedName -or
-        $ResourceName -like "*$_*"
+    $Found = $false
+    foreach ($decl in $LocalResourceDeclarations) {
+        if ($decl.Name -eq $ResourceName -and $decl.Type -eq $ResourceType) {
+            $Found = $true
+            break
+        }
     }
-    
-    if (-not $LocalMatch) {
+    if (-not $Found) {
         $MissingLocally += @{
             Name = $ResourceName
             Type = $ResourceType
@@ -146,7 +154,7 @@ foreach ($AzResource in $AllAzureResources) {
 }
 
 if ($MissingLocally.Count -gt 0) {
-    Write-Host "`n🔍 MISSING IN LOCAL BICEP: $($MissingLocally.Count) Azure resource(s) have no local Bicep file:" -ForegroundColor Magenta
+    Write-Host "`n🔍 MISSING IN LOCAL BICEP: $($MissingLocally.Count) Azure resource(s) have no local Bicep file (name AND type):" -ForegroundColor Magenta
     $MissingLocally | ForEach-Object {
         Write-Host "  ❌ $($_.Name) [$($_.Type)]" -ForegroundColor Magenta
     }
